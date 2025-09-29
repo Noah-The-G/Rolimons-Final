@@ -1,48 +1,76 @@
 import express from "express";
 import fetch from "node-fetch";
-import NodeCache from "node-cache";
+import cors from "cors";
 
 const app = express();
-const cache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); // cache 5 minutes
+app.use(cors());
 
-const ROLIMONS_BASE = "https://api.rolimons.com";
+const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => res.send("Rolimons proxy running"));
+// Cache Rolimons item details to avoid hammering their API
+let itemDetailsCache = null;
+let lastItemDetailsFetch = 0;
+const ITEM_DETAILS_URL = "https://www.rolimons.com/itemapi/itemdetails";
+const ITEM_CACHE_TTL = 1000 * 60 * 10; // 10 minutes
 
-app.get("/api/player/:userid", async (req, res) => {
-  const userId = String(req.params.userid).replace(/\\D/g, "");
-  if (!userId) return res.status(400).json({ success: false, error: "invalid user id" });
+async function getItemDetails() {
+  const now = Date.now();
+  if (!itemDetailsCache || now - lastItemDetailsFetch > ITEM_CACHE_TTL) {
+    const res = await fetch(ITEM_DETAILS_URL);
+    itemDetailsCache = await res.json();
+    lastItemDetailsFetch = now;
+  }
+  return itemDetailsCache;
+}
 
-  const cacheKey = `player:${userId}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return res.json({ ...cached, cached: true });
+// Fetch player assets from Roblox API
+async function getPlayerAssets(userId) {
+  const url = `https://inventory.roblox.com/v1/users/${userId}/assets/collectibles?sortOrder=Asc&limit=100`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Roblox API error ${res.status}`);
+  return await res.json();
+}
 
-  const endpoint = `${ROLIMONS_BASE}/players/v1/playerassets/${userId}`;
-
+// Route: /api/player/:id
+app.get("/api/player/:id", async (req, res) => {
+  const userId = req.params.id;
   try {
-    const r = await fetch(endpoint, { method: "GET" });
-    if (!r.ok) {
-      return res.status(502).json({ success: false, error: "upstream error", status: r.status });
+    const [assets, itemDetails] = await Promise.all([
+      getPlayerAssets(userId),
+      getItemDetails()
+    ]);
+
+    let totalValue = 0;
+    let totalRap = 0;
+
+    if (assets && assets.data) {
+      for (const item of assets.data) {
+        const itemId = String(item.assetId);
+        const rap = item.recentAveragePrice || 0;
+
+        // Lookup Rolimon’s value if available
+        const rolData = itemDetails.items[itemId];
+        const value = rolData ? rolData[4] : 0; // index 4 = value in Rolimon’s API
+
+        totalRap += rap;
+        totalValue += value || rap; // fallback to RAP if no value exists
+      }
     }
-    const data = await r.json();
 
-    const out = {
+    res.json({
       success: true,
-      playerId: data.playerId ?? Number(userId),
-      value: data.value ?? data.playerValue ?? null,
-      rap: data.rap ?? null,
-      playerAssets: data.playerAssets ?? data.assets ?? [],
-    };
-
-    cache.set(cacheKey, out, 300);
-    return res.json({ ...out, cached: false });
+      playerId: userId,
+      value: totalValue,
+      rap: totalRap,
+      cached: false
+    });
   } catch (err) {
-    console.error("proxy error", err);
-    return res.status(500).json({ success: false, error: "internal error" });
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.post("/api/clearCache", (req, res) => { cache.flushAll(); res.json({ ok: true }); });
+app.listen(PORT, () => {
+  console.log(`Proxy running on port ${PORT}`);
+});
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
